@@ -13,8 +13,40 @@
 #include "dutil.h"
 
 static struct conf_fprintf conf = {
-	.emit_stats	= 1,
+	.emit_stats	= 0,
 };
+
+struct header_line_t
+{
+	struct list_item node;
+	struct tag *tag;
+};
+
+struct header_info_t
+{
+	struct list_item node;
+	const char *filename;
+};
+
+FILE *fd = NULL;
+
+char *strncpy2(char *dest, const char *src, size_t n)
+{
+	char *ret = strncpy(dest, src, n);
+	dest[n] = 0;
+	return ret;
+}
+
+static void mkdir_p(const char *path)
+{
+	for(const char *path2 = path; (path2 = strchr(path, '/')); path = path2 + 1)
+	{
+		char dir[128];
+
+		strncpy2(dir, path, path2 - path);
+		printf("Creating dir: %s\n", dir);
+	}
+}
 
 static void emit_tag(struct tag *tag, uint32_t tag_id, struct cu *cu)
 {
@@ -39,34 +71,58 @@ static void emit_tag(struct tag *tag, uint32_t tag_id, struct cu *cu)
 	printf(" /* size: %zd */\n\n", tag__size(tag, cu));
 }
 
+int exits = 1;
+
 static int cu__emit_tags(struct cu *cu)
 {
 	uint32_t i;
 	struct tag *tag;
+	
+	if(!strncmp(cu->name, "../", 3))
+	{
+		return 0;
+	}
+	
+	mkdir_p(cu->name);
 
-	puts("/* Types: */\n");
+	printf("FILENAME: %s\n", cu->name);
+
+	puts("/* Types: */");
 	cu__for_each_type(cu, i, tag)
+	{
+		switch(tag->tag)
+		{
+		case DW_TAG_base_type:
+		case DW_TAG_const_type:
+			continue;
+		}
+		
+		printf("\ndeclared at %s:%i", tag__decl_file(tag, cu), tag__decl_line(tag, cu));
+		
 		emit_tag(tag, i, cu);
+	}
 
-	puts("/* Functions: */\n");
+	puts("\n/* Functions: */");
 	conf.no_semicolon = true;
 	struct function *function;
 	cu__for_each_function(cu, i, function) {
-		tag__fprintf(function__tag(function), cu, &conf, stdout);
-		putchar('\n');
-		lexblock__fprintf(&function->lexblock, cu, function, 0,
-				  &conf, stdout);
-		printf(" /* size: %zd */\n\n",
-		       tag__size(function__tag(function), cu));
+		
+		printf("\ndeclared at %s:%i", tag__decl_file(function__tag(function), cu), tag__decl_line(function__tag(function), cu));
+		//tag__fprintf(function__tag(function), cu, &conf, stdout);
+		//putchar('\n');
+		//lexblock__fprintf(&function->lexblock, cu, function, 0,
+		//		  &conf, stdout);
 	}
 	conf.no_semicolon = false;
 
-	puts("\n\n/* Variables: */\n");
+	puts("\n/* Variables: */");
 	cu__for_each_variable(cu, i, tag) {
-		tag__fprintf(tag, cu, NULL, stdout);
-		printf(" /* size: %zd */\n\n", tag__size(tag, cu));
+		printf("\ndeclared at %s:%i", tag__decl_file(tag, cu), tag__decl_line(tag, cu));
+		//tag__fprintf(tag, cu, NULL, stdout);
+		//printf(" /* size: %zd */\n", tag__size(tag, cu));
 	}
 
+	if( !exits-- ) exit(0);
 
 	return 0;
 }
@@ -82,6 +138,7 @@ static enum load_steal_kind pdwtags_stealer(struct cu *cu,
 static struct conf_load pdwtags_conf_load = {
 	.steal = pdwtags_stealer,
 	.conf_fprintf = &conf,
+	.extra_dbg_info = 1,
 };
 
 /* Name and version of program.  */
