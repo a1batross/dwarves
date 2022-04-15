@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
-
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include "dwarves.h"
 #include "dutil.h"
 
@@ -16,19 +18,22 @@ static struct conf_fprintf conf = {
 	.emit_stats	= 0,
 };
 
-struct header_line_t
+typedef struct
 {
-	struct list_item node;
+	struct list_head node;
+	int linenum;
 	struct tag *tag;
-};
+	struct cu *cu;
+} header_line_t;
 
-struct header_info_t
+typedef struct
 {
-	struct list_item node;
+	struct list_head node;
 	const char *filename;
-};
+	struct list_head lines;
+} header_info_t;
 
-FILE *fd = NULL;
+LIST_HEAD(headers);
 
 char *strncpy2(char *dest, const char *src, size_t n)
 {
@@ -37,46 +42,105 @@ char *strncpy2(char *dest, const char *src, size_t n)
 	return ret;
 }
 
+static bool strcaseendswith(const char *s1, const char *s2)
+{
+	int len1 = strlen(s1);
+	int len2 = strlen(s2);
+	
+	if( len1 < len2 )
+		return false;
+	
+	return !strcasecmp(s1 + len1 - len2, s2);
+}
+
+static bool filename_looks_like_header(const char *filename)
+{
+	return strcaseendswith(filename, ".h");
+}
+
+static header_info_t *find_or_create_header(const char *filename)
+{
+	header_info_t *header;
+	
+	list_for_each_entry(header, &headers, node)
+	{
+		if( !strcmp( header->filename, filename ))
+		{
+			return header;
+		}
+	}
+	
+	header = malloc( sizeof( header_info_t ));
+	header->filename = strdup(filename);
+	INIT_LIST_HEAD(&header->lines);
+	
+	list_add_tail(&header->node, &headers);
+	
+	return header;
+}
+
+static bool find_or_insert_line(header_info_t *header, int linenum, struct tag *tag, struct cu *cu)
+{
+	header_line_t *line, *new;
+	
+	list_for_each_entry_reverse(line, &header->lines, node)
+	{
+		if( line->linenum == linenum && tag__orig_id(line->tag, line->cu) == tag__orig_id(tag, cu))
+			return false;
+		
+		if( line->linenum <= linenum )
+			break;
+	}
+	
+	new = malloc( sizeof( header_line_t ));
+	new->linenum = linenum;
+	new->tag = tag;
+	new->cu = cu;
+	list_add(&new->node, &line->node);
+	
+	return true;
+}
+
 static void mkdir_p(const char *path)
 {
+	char orig_dir[2048];
+	getcwd(orig_dir, sizeof( orig_dir ));
+	
 	for(const char *path2 = path; (path2 = strchr(path, '/')); path = path2 + 1)
 	{
 		char dir[128];
 
 		strncpy2(dir, path, path2 - path);
 		printf("Creating dir: %s\n", dir);
+		
+		mkdir(dir, 0777);
+		
+		chdir(dir);
 	}
+	
+	chdir(orig_dir);
 }
 
-static void emit_tag(struct tag *tag, uint32_t tag_id, struct cu *cu)
+static void emit_tag(struct tag *tag, uint32_t tag_id, struct cu *cu, FILE *fp)
 {
-	printf("/* %d */\n", tag_id);
-
 	if (tag__is_struct(tag))
 		class__find_holes(tag__class(tag));
 
-	if (tag->tag == DW_TAG_base_type) {
-		char bf[64];
-		const char *name = base_type__name(tag__base_type(tag), bf, sizeof(bf));
-
-		if (name == NULL)
-			printf("anonymous base_type\n");
-		else
-			puts(name);
-	} else if (tag__is_pointer(tag))
-		printf(" /* pointer to %lld */\n", (unsigned long long)tag->type);
+	if (tag__is_pointer(tag))
+		fprintf(fp, " /* pointer to %lld %s */\n", (unsigned long long)tag->type, dwarf_tag_name(tag->tag));
 	else
-		tag__fprintf(tag, cu, &conf, stdout);
-
-	printf(" /* size: %zd */\n\n", tag__size(tag, cu));
+		tag__fprintf(tag, cu, &conf, fp);
+	
+	fprintf(fp, "/* %d, size: %zd */\n\n", tag_id, tag__size(tag, cu));
 }
-
-int exits = 1;
 
 static int cu__emit_tags(struct cu *cu)
 {
 	uint32_t i;
 	struct tag *tag;
+	const char *file;
+	header_info_t *header;
+	FILE *fp;
 	
 	if(!strncmp(cu->name, "../", 3))
 	{
@@ -84,46 +148,85 @@ static int cu__emit_tags(struct cu *cu)
 	}
 	
 	mkdir_p(cu->name);
+	
+	fp = fopen(cu->name, "w+");
 
-	printf("FILENAME: %s\n", cu->name);
-
-	puts("/* Types: */");
+	fputs("/****************** Types: ******************/\n", fp);
 	cu__for_each_type(cu, i, tag)
 	{
 		switch(tag->tag)
 		{
 		case DW_TAG_base_type:
 		case DW_TAG_const_type:
+		case DW_TAG_array_type:
+		case DW_TAG_pointer_type:
+		case DW_TAG_reference_type:
+		case DW_TAG_subroutine_type:
+		case DW_TAG_unspecified_type:
+		case DW_TAG_rvalue_reference_type:
 			continue;
 		}
 		
-		printf("\ndeclared at %s:%i", tag__decl_file(tag, cu), tag__decl_line(tag, cu));
-		
-		emit_tag(tag, i, cu);
+		file = tag__decl_file(tag, cu);
+		if( file && filename_looks_like_header( file ))
+		{
+			header = find_or_create_header(file);
+			find_or_insert_line(header, tag__decl_line(tag, cu), tag, cu);
+		}
+		else
+		{
+			// probably a forward declaration, skip for now
+			if( tag__size(tag, cu) == 0 )
+				continue;
+			
+			emit_tag(tag, i, cu, fp);
+		}
+	}
+	
+	fputs("\n/****************** Variables: ******************/\n", fp);
+	cu__for_each_variable(cu, i, tag) {
+		file = tag__decl_file(tag, cu);
+		if( file && filename_looks_like_header( file ))
+		{
+			header = find_or_create_header(file);
+			find_or_insert_line(header, tag__decl_line(tag, cu), tag, cu);
+		}
+		else
+		{
+			struct variable *variable = tag__variable(tag);
+			
+			if( variable->scope == VSCOPE_LOCAL )
+				continue;
+			
+			tag__fprintf(tag, cu, NULL, fp);
+			fprintf(fp, " /* size: %zd scope: %s */\n", tag__size(tag, cu), variable__scope_str(variable));
+		}
 	}
 
-	puts("\n/* Functions: */");
+	fputs("\n/****************** Functions: ******************/\n", fp);
 	conf.no_semicolon = true;
 	struct function *function;
 	cu__for_each_function(cu, i, function) {
-		
-		printf("\ndeclared at %s:%i", tag__decl_file(function__tag(function), cu), tag__decl_line(function__tag(function), cu));
-		//tag__fprintf(function__tag(function), cu, &conf, stdout);
-		//putchar('\n');
-		//lexblock__fprintf(&function->lexblock, cu, function, 0,
-		//		  &conf, stdout);
+		struct tag *tag = function__tag(function);
+		file = tag__decl_file(tag, cu);
+		if( file && filename_looks_like_header( file ))
+		{
+			header = find_or_create_header(file);
+			find_or_insert_line(header, tag__decl_line(tag, cu), tag, cu);
+		}
+		else
+		{
+			tag__fprintf(tag, cu, &conf, fp);
+			fputs("\n", fp);
+			lexblock__fprintf(&function->lexblock, cu, function, 0,
+				  &conf, fp);
+			fputs("\n\n", fp);
+		}
 	}
 	conf.no_semicolon = false;
 
-	puts("\n/* Variables: */");
-	cu__for_each_variable(cu, i, tag) {
-		printf("\ndeclared at %s:%i", tag__decl_file(tag, cu), tag__decl_line(tag, cu));
-		//tag__fprintf(tag, cu, NULL, stdout);
-		//printf(" /* size: %zd */\n", tag__size(tag, cu));
-	}
-
-	if( !exits-- ) exit(0);
-
+	fclose(fp);
+	
 	return 0;
 }
 
@@ -139,6 +242,7 @@ static struct conf_load pdwtags_conf_load = {
 	.steal = pdwtags_stealer,
 	.conf_fprintf = &conf,
 	.extra_dbg_info = 1,
+	.get_addr_info = 1,
 };
 
 /* Name and version of program.  */
