@@ -68,12 +68,18 @@ static bool filename_looks_like_header(const char *filename)
 	return strcaseendswith(filename, ".h");
 }
 
+#define IGNORE_UPPER_DIRECTORY 0
+
 static header_info_t *find_or_create_header(const char *filename)
 {
 	header_info_t *header;
 	
+	filename += strcasestartswith( filename, "/" );
+	
+#if IGNORE_UPPER_DIRECTORY
 	if( strcasestartswith( filename, "../" ))
 		return NULL;
+#endif
 	
 	if( strcasestartswith( filename, "/usr/" ))
 		return NULL;
@@ -81,6 +87,9 @@ static header_info_t *find_or_create_header(const char *filename)
 	if( strcasestartswith( filename, "/fs/root/build/host/glibc-2.29/" ))
 		return NULL;
 	
+#if !IGNORE_UPPER_DIRECTORY
+	filename += strcasestartswith( filename, "../" );
+#endif
 	filename += strcasestartswith( filename, "/fs/root/build/x86_64/lccrt/" );
 	filename += strcasestartswith( filename, "fs/root/build/x86_64/lccrt/" );
 	filename += strcasestartswith( filename, "./" );
@@ -309,20 +318,24 @@ static int cu__emit_tags(struct cu *cu)
 	uint32_t i;
 	struct tag *tag;
 	struct function *function;
+	const char *name = cu->name;
 	FILE *fp;
 	
-	if(!strncmp(cu->name, "../", 3))
-	{
+#if IGNORE_UPPER_DIRECTORY
+	if( strcasestartswith(name, "../" ))
 		return 0;
-	}
+#else
+	name += strcasestartswith(name, "../" );
+#endif
+
+	printf( "SOURCE: %s\n", name );
 	
-	mkdir_p(cu->name);
+	mkdir_p(name);
 	
-	printf( "SOURCE: %s\n", cu->name );
 #if NO_WRITE_FILES
 	fp = stdout;
 #else
-	fp = fopen(cu->name, "w+");
+	fp = fopen(name, "w+");
 #endif
 
 	fputs("/****************** Types:     ******************/\n", fp);
