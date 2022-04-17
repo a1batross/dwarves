@@ -155,6 +155,10 @@ set(pdwtags_SRCS pdwtags.c)
 add_executable(pdwtags ${pdwtags_SRCS})
 target_link_libraries(pdwtags dwarves)
 
+set(psrcgen_SRCS psrcgen.c)
+add_executable(psrcgen ${psrcgen_SRCS})
+target_link_libraries(psrcgen dwarves)
+
 set(pglobal_SRCS pglobal.c)
 add_executable(pglobal ${pglobal_SRCS})
 target_link_libraries(pglobal dwarves)
