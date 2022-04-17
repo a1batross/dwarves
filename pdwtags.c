@@ -2,6 +2,7 @@
   SPDX-License-Identifier: GPL-2.0-only
 
   Copyright (C) 2007-2016 Arnaldo Carvalho de Melo <acme@kernel.org>
+  Copyright (C) 2022 Alibek Omarov <a1ba.omarov@gmail.com>
 */
 
 #include <argp.h>
@@ -14,26 +15,8 @@
 #include "dwarves.h"
 #include "dutil.h"
 
-static struct conf_fprintf conf = {
-	.emit_stats	= 0,
-};
-
-typedef struct
-{
-	struct list_head node;
-	int linenum;
-	struct tag *tag;
-	struct cu *cu;
-} header_line_t;
-
-typedef struct
-{
-	struct list_head node;
-	const char *filename;
-	struct list_head lines;
-} header_info_t;
-
-LIST_HEAD(headers);
+#define IGNORE_UPPER_DIRECTORY 1
+#define NO_WRITE_FILES 0
 
 char *strncpy2(char *dest, const char *src, size_t n)
 {
@@ -42,7 +25,7 @@ char *strncpy2(char *dest, const char *src, size_t n)
 	return ret;
 }
 
-static bool strcaseendswith(const char *s1, const char *s2)
+static bool endswith(const char *s1, const char *s2)
 {
 	int len1 = strlen(s1);
 	int len2 = strlen(s2);
@@ -50,77 +33,199 @@ static bool strcaseendswith(const char *s1, const char *s2)
 	if( len1 < len2 )
 		return false;
 	
-	return !strcasecmp(s1 + len1 - len2, s2);
+	return !strncmp(s1 + len1 - len2, s2, len2);
 }
-
-static int strcasestartswith( const char *s1, const char *s2 )
+ 
+static bool filename_looks_like_header(const char *s1)
+{
+	return endswith(s1, ".h") || endswith(s1, ".H");
+}
+ 
+static int startswith( const char *s1, const char *s2 )
 {
 	int len2 = strlen(s2);
 	
-	if( !strncasecmp(s1, s2, len2))
+	if( !strncmp(s1, s2, len2))
 		return len2;
 	
 	return 0;
 }
 
-static bool filename_looks_like_header(const char *filename)
+static void mkdir_p(const char *path)
 {
-	return strcaseendswith(filename, ".h");
+#if NO_WRITE_FILES
+	return;
+#else
+	char orig_dir[2048];
+	getcwd(orig_dir, sizeof( orig_dir ));
+	
+	for(const char *path2 = path; (path2 = strchr(path, '/')); path = path2 + 1)
+	{
+		char dir[128];
+
+		strncpy2(dir, path, path2 - path);
+		
+		mkdir(dir, 0777);
+		
+		chdir(dir);
+	}
+	
+	chdir(orig_dir);
+#endif
 }
 
-#define IGNORE_UPPER_DIRECTORY 0
+// ========================================================================
 
-static header_info_t *find_or_create_header(const char *filename)
+typedef struct
 {
-	header_info_t *header;
+	struct list_head node;
+	int linenum;
+	char *include;
+	struct tag *tag;
+	struct cu *cu;
+} srcfile_line_t;
+
+typedef struct
+{
+	struct list_head node;
+	const char *filename;
+	struct list_head lines;
+} srcfile_t;
+
+LIST_HEAD(g_SourceFiles);
+
+typedef struct include_t 
+{
+	struct list_head node;
+	char *filename;
+	struct include_t *parent;
+} include_t;
+
+LIST_HEAD(g_Includes);
+
+static srcfile_t *find_or_create_srcfile(const char *filename);
+static bool find_or_insert_line(srcfile_t *sourceFile, int linenum, struct tag *tag, struct cu *cu, const char *include);
+
+static void include_detector_init( void )
+{
+	include_t *ptr, *next;
+
+	list_for_each_entry_safe(ptr, next, &g_Includes, node)
+	{
+		list_del(&ptr->node);
+		free(ptr->filename);
+		free(ptr);
+	}
+
+	INIT_LIST_HEAD(&g_Includes);
+}
+
+static void include_detector_push(const char *filename)
+{
+	include_t *include;
+
+	include = malloc( sizeof( include_t ));
+	include->filename = strdup( filename );
+	include->parent = NULL;
+	list_add_tail(&include->node, &g_Includes);
+}
+
+static void include_detector_detect1(struct cu *cu)
+{
+	include_t *inc1;
+
+	// for each include we find next duplicate
+	// it PROBABLY means that everything in between
+	// belongs to that include
+// 	list_for_each_entry(inc1, &g_Includes, node)
+// 	{
+// 		include_t *inc2;
+// 		
+// 		list_for_each_entry(inc2, inc1->node.next, node)
+// 		{
+// 			include_t *inc3;
+// 
+// 			if( strcmp( inc1->filename, inc2->filename ))
+// 				continue;
+// 
+// 			list_for_each_entry_reverse(inc3, inc2->node.prev, node)
+// 			{
+// 				if( inc1 == inc3 )
+// 					break;
+// 
+// 				inc3->parent = inc1;
+// 			}
+// 		}
+// 	}
 	
-	filename += strcasestartswith( filename, "/" );
+	list_for_each_entry(inc1, &g_Includes, node)
+	{
+		if( filename_looks_like_header( inc1->filename ))
+		{
+			srcfile_t *srcfile = find_or_create_srcfile(cu->name);
+			
+			if( srcfile )
+				find_or_insert_line(srcfile, -1, NULL, NULL, inc1->filename);
+		}
+	}
+}
+
+static srcfile_t *find_or_create_srcfile(const char *filename)
+{
+	srcfile_t *srcfile;
+	
+	filename += startswith( filename, "/" );
 	
 #if IGNORE_UPPER_DIRECTORY
-	if( strcasestartswith( filename, "../" ))
+	if( startswith( filename, "../" ))
 		return NULL;
 #endif
 	
-	if( strcasestartswith( filename, "/usr/" ))
+	if( startswith( filename, "usr/" ))
 		return NULL;
 	
-	if( strcasestartswith( filename, "/fs/root/build/host/glibc-2.29/" ))
+	if( startswith( filename, "fs/root/build/host/glibc-2.29/" )) 
 		return NULL;
 	
 #if !IGNORE_UPPER_DIRECTORY
-	filename += strcasestartswith( filename, "../" );
+	filename += startswith( filename, "../" );
 #endif
-	filename += strcasestartswith( filename, "/fs/root/build/x86_64/lccrt/" );
-	filename += strcasestartswith( filename, "fs/root/build/x86_64/lccrt/" );
-	filename += strcasestartswith( filename, "./" );
-	filename += strcasestartswith( filename, ".obj/" );
-
+	filename += startswith( filename, "/fs/root/build/x86_64/lccrt/" );
+	filename += startswith( filename, "fs/root/build/x86_64/lccrt/" );
+	filename += startswith( filename, "./" );
+	filename += startswith( filename, ".obj/" );
 	
-	list_for_each_entry(header, &headers, node)
+	include_detector_push(filename);
+
+	list_for_each_entry(srcfile, &g_SourceFiles, node)
 	{
-		if( !strcmp( header->filename, filename ))
+		if( !strcmp( srcfile->filename, filename ))
 		{
-			return header;
+			return srcfile;
 		}
 	}
 	
-	header = malloc( sizeof( header_info_t ));
-	header->filename = strdup(filename);
-	INIT_LIST_HEAD(&header->lines);
+	srcfile = malloc( sizeof( srcfile_t ));
+	srcfile->filename = strdup(filename);
+	INIT_LIST_HEAD(&srcfile->lines);
 	
-	list_add_tail(&header->node, &headers);
+	list_add_tail(&srcfile->node, &g_SourceFiles);
 	
-	return header;
+	return srcfile;
 }
 
-static bool find_or_insert_line(header_info_t *header, int linenum, struct tag *tag, struct cu *cu)
+static bool find_or_insert_line(srcfile_t *sourceFile, int linenum, struct tag *tag, struct cu *cu, const char *include)
 {
-	header_line_t *line, *new;
+	srcfile_line_t *line, *new;
 	
-	list_for_each_entry_reverse(line, &header->lines, node)
+	list_for_each_entry_reverse(line, &sourceFile->lines, node)
 	{
 		if( line->linenum == linenum ) // && tag__orig_id(line->tag, line->cu) == tag__orig_id(tag, cu))
 		{
+			// special case for include insert
+			if( line->include )
+				break;
+
 			line->tag = tag;
 			line->cu = cu;
 			return false;
@@ -130,52 +235,124 @@ static bool find_or_insert_line(header_info_t *header, int linenum, struct tag *
 			break;
 	}
 	
-	new = malloc( sizeof( header_line_t ));
+	new = malloc( sizeof( srcfile_line_t ));
 	new->linenum = linenum;
 	new->tag = tag;
 	new->cu = cu;
+	new->include = include ? strdup(include) : 0;
 	list_add(&new->node, &line->node);
 	
 	return true;
 }
 
-static void add_header_tag(const char *file, struct tag *tag, struct cu *cu, FILE *fp)
+static void add_srcfile_tag(struct tag *tag, struct cu *cu)
 {
-	//static const char *prev = NULL;
+	const char *file = tag__decl_file(tag, cu);
+	srcfile_t *srcfile;
 	
-	header_info_t *header;
-	header = find_or_create_header(file);
+	if( !file )
+		return;
 	
-	if( header )
-	{
-		find_or_insert_line(header, tag__decl_line(tag, cu), tag, cu);
-		
-#if 0
-		if( prev != header->filename )
-		{
-			fprintf( fp, "#include \"%s\"\n", header->filename);
-		}
-		prev = header->filename;
-#endif
-	}
+	srcfile = find_or_create_srcfile(file);
+	
+	if( srcfile )
+		find_or_insert_line(srcfile, tag__decl_line(tag, cu), tag, cu, NULL);
 }
 
-static void emit_tag(struct tag *tag, struct cu *cu, FILE *fp)
+// ========================================================================
+
+static struct conf_fprintf conf = {
+	.emit_stats	= 0,
+};
+
+static void print_type(struct tag *tag, struct cu *cu, FILE *fp)
 {
+	fprintf(fp, "/* line: %i */\n", tag__decl_line(tag, cu));
+
 	if (tag__is_struct(tag))
 		class__find_holes(tag__class(tag));
 
-	if (tag__is_pointer(tag))
-		fprintf(fp, " /* pointer to %lld %s */\n", (unsigned long long)tag->type, dwarf_tag_name(tag->tag));
-	else
-		tag__fprintf(tag, cu, &conf, fp);
-	
+	tag__fprintf(tag, cu, &conf, fp);
+
 	fprintf(fp, " /* size: %zd */\n\n", tag__size(tag, cu));
 }
 
-static void print_types(struct cu *cu, struct tag *tag, bool header, FILE *fp)
+static void print_function(struct tag *tag, struct cu *cu, FILE *fp)
 {
-	const char *file;
+	conf.no_semicolon = true;
+	{	
+		struct function *f = tag__function(tag);
+		int c = tag__fprintf(tag, cu, &conf, fp);
+		if( c >= 70 ) c = 69; // nice
+		
+		fprintf(fp, "%-*.*s// %5u\n", 70 - c, 70 - c, " ",
+			 tag__decl_line(tag, cu));
+		lexblock__fprintf(&f->lexblock, cu, f, 0, &conf, fp);
+		fputs("\n\n", fp);
+	}
+	conf.no_semicolon = false;
+}
+
+static void print_variable(struct tag *tag, struct cu *cu, FILE *fp)
+{
+	tag__fprintf(tag, cu, NULL, fp);
+	fprintf(fp, " /* line: %i, size: %zd, scope: %s */\n\n", tag__decl_line(tag, cu), tag__size(tag, cu), variable__scope_str(tag__variable(tag)));
+}
+
+static void source_files_print( void )
+{
+	srcfile_t *srcfile;
+	
+	list_for_each_entry(srcfile, &g_SourceFiles, node)
+	{
+		printf( "SOURCE FILE: %s\n", srcfile->filename );
+
+		mkdir_p( srcfile->filename );
+		
+		FILE *fp = fopen( srcfile->filename, "w+" );
+		
+		srcfile_line_t *line;
+		bool header = filename_looks_like_header( srcfile->filename );
+		
+		fprintf( fp, "// Generated by psource tool\n" );
+
+		if( header )
+		{
+			fprintf( fp, "#pragma once\n" );
+		}
+		else
+		{
+			fprintf( fp, "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n" );
+		}
+		
+		list_for_each_entry(line, &srcfile->lines, node)
+		{
+			if( line->include )
+			{
+				fprintf(fp, "#include \"%s\"\n", line->include );
+			}
+			else if( tag__is_type(line->tag))
+			{
+				print_type(line->tag, line->cu, fp);
+			}
+			else if( tag__is_variable(line->tag))
+			{
+				print_variable(line->tag, line->cu, fp );
+			}
+			else if( tag__is_function(line->tag))
+			{
+				print_function(line->tag, line->cu, fp );
+			}
+		}
+		
+		fclose(fp);
+	}
+}
+
+// ========================================================================
+
+static void scan_type(struct tag *tag, struct cu *cu)
+{
 	const char *name;
 	
 	switch(tag->tag)
@@ -201,116 +378,21 @@ static void print_types(struct cu *cu, struct tag *tag, bool header, FILE *fp)
 	if( name[0] == '\0' )
 		return;
 	
-	file = header ? 0 : tag__decl_file(tag, cu);
-	if( file && filename_looks_like_header( file ))
-	{
-		add_header_tag(file, tag, cu, fp);
-	}
-	else
-	{
-		// probably a forward declaration, skip for now
-		if( tag__size(tag, cu) == 0 )
-			return;
-		
-		emit_tag(tag, cu, fp);
-	}
-}
-
-static void print_variables(struct cu *cu, struct tag *tag, bool header, FILE *fp)
-{
-	const char *file = header ? 0 : tag__decl_file(tag, cu);
-	if( file && filename_looks_like_header( file ))
-	{
-		add_header_tag(file, tag, cu, fp);
-	}
-	else
-	{
-		struct variable *variable = tag__variable(tag);
-		
-		if( variable->scope == VSCOPE_LOCAL )
-			return;
-		
-		tag__fprintf(tag, cu, NULL, fp);
-		fprintf(fp, " /* size: %zd scope: %s */\n", tag__size(tag, cu), variable__scope_str(variable));
-	}
-}
-
-static void print_functions(struct cu *cu, struct function *function, bool header, FILE *fp)
-{
-	const char *file;
-	struct tag *tag = function__tag(function);
-
-	file = header ? 0 : tag__decl_file(tag, cu);
-	if( file && filename_looks_like_header( file ))
-	{
-		add_header_tag(file, tag, cu, fp);
-	}
-	else
-	{
-		tag__fprintf(tag, cu, &conf, fp);
-		fputs("\n", fp);
-		lexblock__fprintf(&function->lexblock, cu, function, 0,
-			  &conf, fp);
-		fputs("\n\n", fp);
-	}
-}
-
-#define NO_WRITE_FILES 0
-
-static void mkdir_p(const char *path)
-{
-#if NO_WRITE_FILES
-	return;
-#else
-	char orig_dir[2048];
-	getcwd(orig_dir, sizeof( orig_dir ));
+	// probably a forward declaration, skip for now
+	if( tag__size(tag, cu) == 0 )
+		return;
 	
-	for(const char *path2 = path; (path2 = strchr(path, '/')); path = path2 + 1)
-	{
-		char dir[128];
-
-		strncpy2(dir, path, path2 - path);
-		
-		mkdir(dir, 0777);
-		
-		chdir(dir);
-	}
-	
-	chdir(orig_dir);
-#endif
+	add_srcfile_tag(tag, cu);
 }
 
-static void headers_print( void )
+static void scan_variable(struct tag *tag, struct cu *cu)
 {
-	header_info_t *header;
+	struct variable *variable = tag__variable(tag);
 	
-	list_for_each_entry(header, &headers, node)
-	{
-		printf( "HEADER: %s\n", header->filename );
-		
-		mkdir_p( header->filename );
-		
-		FILE *fp = fopen( header->filename, "w+" );
-		
-		header_line_t *line;
-		list_for_each_entry(line, &header->lines, node)
-		{
-			if( tag__is_type(line->tag))
-			{
-				print_types(line->cu, line->tag, true, fp);
-			}
-			else if( tag__is_variable(line->tag))
-			{
-				print_variables(line->cu, line->tag, true, fp );
-			}
-			else if( tag__is_function(line->tag))
-			{
-				print_functions(line->cu, tag__function(line->tag), true, fp );
-			}
-		}
-		
-		fclose(fp);
-	}
+	if( variable->scope == VSCOPE_LOCAL )
+		return;
+	
+	add_srcfile_tag(tag, cu);
 }
 
 static int cu__emit_tags(struct cu *cu)
@@ -319,43 +401,29 @@ static int cu__emit_tags(struct cu *cu)
 	struct tag *tag;
 	struct function *function;
 	const char *name = cu->name;
-	FILE *fp;
 	
 #if IGNORE_UPPER_DIRECTORY
-	if( strcasestartswith(name, "../" ))
+	if( startswith(name, "../" ))
 		return 0;
 #else
-	name += strcasestartswith(name, "../" );
+	name += startswith(name, "../" );
 #endif
-
-	printf( "SOURCE: %s\n", name );
 	
-	mkdir_p(name);
-	
-#if NO_WRITE_FILES
-	fp = stdout;
-#else
-	fp = fopen(name, "w+");
-#endif
+	include_detector_init();
 
-	fputs("/****************** Types:     ******************/\n", fp);
 	cu__for_each_type(cu, i, tag) {
-		print_types(cu, tag, false, fp);
+		scan_type(tag, cu);
 	}
 	
-	fputs("\n/****************** Variables: ******************/\n", fp);
 	cu__for_each_variable(cu, i, tag) {
-		print_variables(cu, tag, false, fp);
+		scan_variable(tag, cu);
 	}
 
-	fputs("\n/****************** Functions: ******************/\n", fp);
-	conf.no_semicolon = true;
 	cu__for_each_function(cu, i, function) {
-		print_functions(cu, function, false, fp);
+		add_srcfile_tag(function__tag(function), cu);
 	}
-	conf.no_semicolon = false;
-
-	fclose(fp);
+	
+	include_detector_detect1(cu);
 
 	return 0;
 }
@@ -440,7 +508,7 @@ int main(int argc, char *argv[])
 	err = cus__load_file(cus, &pdwtags_conf_load, argv[remaining]);
 	if (err == 0) {
 		rc = EXIT_SUCCESS;
-		headers_print();
+		source_files_print();
 		goto out;
 	}
 
