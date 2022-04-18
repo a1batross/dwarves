@@ -125,6 +125,13 @@ static void include_detector_init( void )
 static void include_detector_push(const char *filename)
 {
 	include_t *include;
+	
+	if( !list_empty( &g_Includes ))
+	{
+		include = container_of( g_Includes.prev, include_t, node );
+		if( !strcmp( include->filename, filename ))
+			return;
+	}
 
 	include = malloc( sizeof( include_t ));
 	include->filename = strdup( filename );
