@@ -424,7 +424,7 @@ static int cu__emit_tags(struct cu *cu)
 	return 0;
 }
 
-static enum load_steal_kind pdwtags_stealer(struct cu *cu,
+static enum load_steal_kind psrcgen_stealer(struct cu *cu,
 					    struct conf_load *conf_load __maybe_unused,
 					    void *thr_data __maybe_unused)
 {
@@ -433,8 +433,8 @@ static enum load_steal_kind pdwtags_stealer(struct cu *cu,
 	return LSK__KEEPIT;
 }
 
-static struct conf_load pdwtags_conf_load = {
-	.steal = pdwtags_stealer,
+static struct conf_load psrcgen_conf_load = {
+	.steal = psrcgen_stealer,
 	.conf_fprintf = &conf,
 	.extra_dbg_info = 1,
 	.get_addr_info = 1,
@@ -443,7 +443,7 @@ static struct conf_load pdwtags_conf_load = {
 /* Name and version of program.  */
 ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 
-static const struct argp_option pdwtags__options[] = {
+static const struct argp_option psrcgen__options[] = {
 	{
 		.name = "format_path",
 		.key  = 'F',
@@ -470,7 +470,7 @@ static const struct argp_option pdwtags__options[] = {
 	}
 };
 
-static error_t pdwtags__options_parser(int key, char *arg __maybe_unused,
+static error_t psrcgen__options_parser(int key, char *arg __maybe_unused,
 				      struct argp_state *state)
 {
 	switch (key) {
@@ -478,7 +478,7 @@ static error_t pdwtags__options_parser(int key, char *arg __maybe_unused,
 		if (state->child_inputs != NULL)
 			state->child_inputs[0] = state->input;
 		break;
-	case 'F': pdwtags_conf_load.format_path = arg;	break;
+	case 'F': psrcgen_conf_load.format_path = arg;	break;
 	case 'V': conf.show_decl_info = 1;		break;
 	case 'S': conf.classes_as_structs = 1;		break;
 	case 'u': g_strip_upper_directory = true;	break;
@@ -487,12 +487,12 @@ static error_t pdwtags__options_parser(int key, char *arg __maybe_unused,
 	return 0;
 }
 
-static const char pdwtags__args_doc[] = "FILE";
+static const char psrcgen__args_doc[] = "FILE";
 
-static struct argp pdwtags__argp = {
-	.options  = pdwtags__options,
-	.parser	  = pdwtags__options_parser,
-	.args_doc = pdwtags__args_doc,
+static struct argp psrcgen__argp = {
+	.options  = psrcgen__options,
+	.parser	  = psrcgen__options_parser,
+	.args_doc = psrcgen__args_doc,
 };
 
 int main(int argc, char *argv[])
@@ -501,26 +501,26 @@ int main(int argc, char *argv[])
 	struct cus *cus = cus__new();
 
 	if (dwarves__init() || cus == NULL) {
-		fputs("pwdtags: insufficient memory\n", stderr);
+		fputs("psrcgen: insufficient memory\n", stderr);
 		goto out;
 	}
 
-	dwarves__resolve_cacheline_size(&pdwtags_conf_load, 0);
+	dwarves__resolve_cacheline_size(&psrcgen_conf_load, 0);
 
-	if (argp_parse(&pdwtags__argp, argc, argv, 0, &remaining, NULL) ||
+	if (argp_parse(&psrcgen__argp, argc, argv, 0, &remaining, NULL) ||
 	    remaining == argc) {
-                argp_help(&pdwtags__argp, stderr, ARGP_HELP_SEE, argv[0]);
+                argp_help(&psrcgen__argp, stderr, ARGP_HELP_SEE, argv[0]);
                 goto out;
 	}
 
-	err = cus__load_file(cus, &pdwtags_conf_load, argv[remaining]);
+	err = cus__load_file(cus, &psrcgen_conf_load, argv[remaining]);
 	if (err == 0) {
 		rc = EXIT_SUCCESS;
 		source_files_print();
 		goto out;
 	}
 
-	cus__fprintf_load_files_err(cus, "pdwtags", argv + remaining, err, stderr);
+	cus__fprintf_load_files_err(cus, "psrcgen", argv + remaining, err, stderr);
 out:
 	cus__delete(cus);
 	dwarves__exit();
